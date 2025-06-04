@@ -1,0 +1,132 @@
+audio_length: 0.3
+augmentation:
+  strong:
+    add_noise: true
+    freq_mask: true
+    freq_mask_count: 3
+    freq_mask_width: 15
+    gain_factor_range:
+    - 0.5
+    - 1.5
+    noise_level: 0.02  # Reverted from 0.025
+    pitch_shift: true
+    pitch_shift_range:
+    - -2.5
+    - 2.5  # Reduced from [-3.0, 3.0]
+    random_gain: true
+    reverb: true
+    reverb_factor: 0.3  # Reverted from 0.35
+    shift_factor: 0.3  # Reverted from 0.35
+    stretch_factor_range:
+    - 0.7
+    - 1.3
+    time_mask: true
+    time_mask_count: 3
+    time_mask_width: 30
+    time_shift: true
+    time_stretch: true
+  weak:
+    add_noise: true
+    noise_level: 0.005  # Reduced from 0.01 to create more contrast with strong
+    pitch_shift: true
+    pitch_shift_range:
+    - -0.5
+    - 0.5  # Reduced range to make weak truly weaker
+    shift_factor: 0.1  # Reduced from 0.15
+    stretch_factor_range:
+    - 0.9
+    - 1.1
+    time_shift: true
+    time_stretch: true
+batch_size: 32
+checkpoint_interval: 20
+data_type: raw
+dataset:
+  class_dict:
+    Ae.Aegypti_F: 0
+    Ae.Aegypti_M: 1
+    Ae.Albopictus_F: 2
+    Ae.Albopictus_M: 3
+    An.Dirus_F: 4
+    An.Dirus_M: 5
+    An.Minimus_F: 6
+    An.Minimus_M: 7
+    Cx.Quin_F: 8
+    Cx.Quin_M: 9
+    No.Mos: 10
+  load_ssl_indices_path: null
+  num_classes: 11
+  path_globs:
+  - dataset/audios/AlmostClearWingbeat/Indoor/*.wav
+  - dataset/audios/EnvironmentalNoises/cat_noise/*.wav
+  save_ssl_indices: false
+  # The split_mode will be automatically determined based on training_mode:
+  # - For supervised: max_train is used (overrides this value)
+  # - For SSL (FixMatch/FlexMatch): fixed is used (overrides this value)
+  split_mode: fixed
+  # Number of labeled samples per class for SSL training
+  ssl_labels_per_class: 350 
+  test_ratio: 0.1
+  test_samples: 50
+  train_ratio: 0.8
+  train_samples: 350
+  unlabeled_data_dir: null
+  val_ratio: 0.1
+  val_samples: 50
+device: cuda
+early_stop_min_delta: 0.001
+early_stop_monitor: val_loss
+early_stop_patience: 80
+early_stop_restore_best: true
+experiment_name: mosquito_classification
+feature_type: stft
+hop_length: 256
+hyperparameter_tuning:
+  enabled: false
+  method: grid
+  metric: val_accuracy
+  n_trials: 10
+  search_spaces:
+    batch_size:
+    - 16
+    - 32
+    - 64
+    learning_rate:
+    - 0.001
+    - 0.0005
+    - 0.0001
+labels_smoothing: 0.01
+learning_rate: 0.001
+log_interval: 10
+model_type: MosSong+
+n_fft: 512
+num_epochs: 1000
+optimizer_type: adam
+reduce_lr_factor: 0.6
+reduce_lr_min_delta: 0.001
+reduce_lr_min_lr: 0.0000001
+reduce_lr_monitor: val_loss
+reduce_lr_patience: 50
+results_dir: results
+sample_rate: 8000
+seed: 42
+ssl:
+  # Temperature parameter for pseudo-label sharpening
+  T: 0.2
+  # Confidence threshold for pseudo-labeling
+  confidence_threshold: 0.9
+  ema_decay: 0.99
+  evaluate_ema_model: true
+  lambda_u: 0.8
+  mu: 2
+  steps_per_epoch_unlabeled: 200
+  # Distribution Alignment for addressing class imbalance
+  use_DA: true 
+  use_ema: true
+steps_per_epoch: 200
+stft_steps_per_epoch: 300
+time_frames: 10
+training_mode: flexmatch
+unlabeled_batch_size: 32  
+warmup_epochs: 1
+waveform_steps_per_epoch: 200
