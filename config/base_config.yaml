@@ -96,7 +96,7 @@ hyperparameter_tuning:
     - 0.0005
     - 0.0001
 labels_smoothing: 0.01
-learning_rate: 0.001
+learning_rate: 0.002
 log_interval: 10
 model_type: MosSong+
 n_fft: 512
@@ -112,12 +112,12 @@ sample_rate: 8000
 seed: 42
 ssl:
   # Temperature parameter for pseudo-label sharpening
-  T: 0.2
+  T: 0.5
   # Confidence threshold for pseudo-labeling
   confidence_threshold: 0.9
-  ema_decay: 0.99
+  ema_decay: 0.999
   evaluate_ema_model: true
-  lambda_u: 0.8
+  lambda_u: 0.5
   mu: 2
   steps_per_epoch_unlabeled: 200
   # Distribution Alignment for addressing class imbalance

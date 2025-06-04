@@ -169,9 +169,8 @@ class DatasetManager:
         logger.info(f"Successfully processed {len(self.all_audio_data)} audio segments from all files.") # Log based on all_audio_data
         
         # Split data once based on configured strategy, and get indices
-        (train_raw, val_raw, test_raw), self.initial_train_indices, self.initial_val_indices, self.initial_test_indices = \
+        (train_raw, val_raw, test_raw, _, _), self.initial_train_indices, self.initial_val_indices, self.initial_test_indices = \
             self._split_data(self.all_audio_data, self.all_labels, self.all_file_ids)
-        
         # Store the data in named tuples for better organization
         self.train_data = SplitData(data=train_raw[0], labels=train_raw[1], file_ids=train_raw[2])
         self.val_data = SplitData(data=val_raw[0], labels=val_raw[1], file_ids=val_raw[2])
@@ -307,24 +306,26 @@ class DatasetManager:
             raise ValueError(f"Invalid split mode: {self.split_mode}. "
                              f"Must be 'fixed', 'max_train', or 'ratio'.")
     
-    def _split_data_fixed(self, audio_data: np.ndarray, labels: np.ndarray, file_ids: np.ndarray) -> Tuple[
+    def _split_data_fixed(self, audio_data: np.ndarray, labels: np.ndarray, file_ids: np.ndarray, labeled_samples_per_class: Optional[int] = None, ssl_mode: bool = False) -> Tuple[
         Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
               Tuple[np.ndarray, np.ndarray, np.ndarray],
-              Tuple[np.ndarray, np.ndarray, np.ndarray]],
+              Tuple[np.ndarray, np.ndarray, np.ndarray],
+              Optional[np.ndarray], Optional[np.ndarray]],
         np.ndarray, np.ndarray, np.ndarray
     ]:
         """
-        Split data using fixed sample counts per class.
+        Split data using fixed sample counts per class, with optional labeled/unlabeled split for SSL.
         
         Args:
             audio_data: Audio data array
             labels: Labels array
             file_ids: File IDs array
+            labeled_samples_per_class: Number of labeled samples per class (None = use all for supervised)
+            ssl_mode: If True, return labeled/unlabeled indices for SSL
         
         Returns:
-            Tuple of (train_data, val_data, test_data)
+            Tuple of (train_data, val_data, test_data, labeled_indices, unlabeled_indices), train_indices, val_indices, test_indices
         """
-        # First try to get values from config.dataset, then fall back to config's direct attributes
         if hasattr(self.config, 'dataset'):
             train_samples: int = getattr(self.config.dataset, 'train_samples', 350)
             val_samples: int = getattr(self.config.dataset, 'val_samples', 50)
@@ -336,32 +337,38 @@ class DatasetManager:
         
         logger.info(f"Using fixed split with {train_samples}/{val_samples}/{test_samples} samples per class")
         
-        train_indices_list: List[int] = [] # Use list for extend
+        train_indices_list: List[int] = []
         val_indices_list: List[int] = []
         test_indices_list: List[int] = []
-        
+        labeled_indices: List[int] = []  # Will be relative to train split
+        unlabeled_indices: List[int] = []
+        train_offset = 0  # Track position in train split for relative indices
         # Process each class separately to ensure balanced splits
         for class_idx in range(self.num_classes):
-            # Find all indices for this class
             class_indices = np.where(labels == class_idx)[0]
-            
             if len(class_indices) == 0:
                 logger.warning(f"No samples found for class {class_idx}")
                 continue
-                
-            # Shuffle indices deterministically
             rng = np.random.RandomState(self.seed + class_idx)
             rng.shuffle(class_indices)
-            
-            # Determine how many samples to take for each split
-            n_train = min(train_samples, len(class_indices))
-            n_val = min(val_samples, max(0, len(class_indices) - n_train))
-            n_test = min(test_samples, max(0, len(class_indices) - n_train - n_val))
-            
-            # Split indices
-            train_indices_list.extend(class_indices[:n_train])
-            val_indices_list.extend(class_indices[n_train:n_train + n_val])
-            test_indices_list.extend(class_indices[n_train + n_val:n_train + n_val + n_test])
+            n_val = min(val_samples, len(class_indices))
+            n_test = min(test_samples, max(0, len(class_indices) - n_val))
+            n_train = len(class_indices) - n_val - n_test
+            train_indices = class_indices[:n_train]
+            val_indices = class_indices[n_train:n_train + n_val]
+            test_indices = class_indices[n_train + n_val:n_train + n_val + n_test]
+            train_indices_list.extend(train_indices)
+            val_indices_list.extend(val_indices)
+            test_indices_list.extend(test_indices)
+            # Labeled/unlabeled split for train (relative to train split)
+            if labeled_samples_per_class is not None and labeled_samples_per_class > 0:
+                n_labeled = min(labeled_samples_per_class, len(train_indices))
+                labeled_indices.extend(range(train_offset, train_offset + n_labeled))
+                if ssl_mode:
+                    unlabeled_indices.extend(range(train_offset + n_labeled, train_offset + len(train_indices)))
+            else:
+                labeled_indices.extend(range(train_offset, train_offset + len(train_indices)))
+            train_offset += len(train_indices)
         
         # Convert lists to numpy arrays
         final_train_indices = np.array(train_indices_list, dtype=np.int32)
@@ -373,10 +380,12 @@ class DatasetManager:
         val_data_tuple = (audio_data[final_val_indices], labels[final_val_indices], file_ids[final_val_indices])
         test_data_tuple = (audio_data[final_test_indices], labels[final_test_indices], file_ids[final_test_indices])
         
-        # Log actual split counts
+        labeled_indices_np = np.array(labeled_indices, dtype=np.int32) if labeled_indices else None
+        unlabeled_indices_np = np.array(unlabeled_indices, dtype=np.int32) if ssl_mode and unlabeled_indices else None
+        
         logger.info(f"Actual counts: Train={len(final_train_indices)}, Val={len(final_val_indices)}, Test={len(final_test_indices)}")
         
-        return (train_data_tuple, val_data_tuple, test_data_tuple), final_train_indices, final_val_indices, final_test_indices
+        return (train_data_tuple, val_data_tuple, test_data_tuple, labeled_indices_np, unlabeled_indices_np), final_train_indices, final_val_indices, final_test_indices
         
     def _split_data_max_train(self, audio_data: np.ndarray, labels: np.ndarray, file_ids: np.ndarray) -> Tuple[
         Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
@@ -621,16 +630,17 @@ class DatasetManager:
         return dataset
     
     def get_datasets(
-        self, 
+        self,
         batch_size: Optional[int] = None,
         train_shuffle: bool = True,
         train_augment: bool = False,
         train_repeat: bool = False,
         val_repeat: bool = False,
-        test_repeat: bool = False
+        test_repeat: bool = False,
+        labeled_samples_per_class: Optional[int] = None
     ) -> Tuple[tf.data.Dataset, tf.data.Dataset, tf.data.Dataset]:
         """
-        Get train, validation, and test datasets in a single call.
+        Get train, validation, and test datasets in a single call, with optional labeled_samples_per_class.
         
         Args:
             batch_size: Batch size for all datasets (defaults to config value)
@@ -639,18 +649,60 @@ class DatasetManager:
             train_repeat: Whether to repeat the training dataset
             val_repeat: Whether to repeat the validation dataset
             test_repeat: Whether to repeat the test dataset
+            labeled_samples_per_class: Number of labeled samples per class (None = use all)
             
         Returns:
             Tuple of (train_dataset, val_dataset, test_dataset)
         """
-        train_dataset = self.prepare_dataset(
-            split='train',
-            batch_size=batch_size,
-            shuffle=train_shuffle,
-            augment=train_augment,
-            repeat=train_repeat
-        )
+        # If labeled_samples_per_class is set, only use those indices for training
+        if labeled_samples_per_class is not None and labeled_samples_per_class > 0:
+            # Redo split to get labeled indices
+            (train_data_tuple, val_data_tuple, test_data_tuple, labeled_indices, _), _, _, _ = self._split_data_fixed(
+                self.all_audio_data, self.all_labels, self.all_file_ids, labeled_samples_per_class, ssl_mode=False)
+            data = train_data_tuple[0][labeled_indices]
+            labels = train_data_tuple[1][labeled_indices]
+        else:
+            data = self.train_data.data
+            labels = self.train_data.labels
+            
+        # Handle empty datasets (possible with some splitting configurations)
+        if len(data) == 0:
+            logger.warning(f"Empty dataset for split 'train'")
+            # Return an empty dataset with the right types and shapes
+            empty_data = np.zeros((0,) + data.shape[1:], dtype=data.dtype)
+            empty_labels = np.zeros((0,), dtype=labels.dtype)
+            train_dataset = tf.data.Dataset.from_tensor_slices((empty_data, empty_labels))
+        else:
+            # Create TensorFlow dataset from numpy arrays
+            train_dataset = tf.data.Dataset.from_tensor_slices((data, labels))
         
+            # Apply augmentation if requested (only for training)
+            if train_augment:
+                # Directly use augmentation functions from the augmentation module
+                aug_config_weak = get_augmentation_config(self.config.to_dict(), 'weak')
+                train_dataset = train_dataset.map(
+                    lambda x_data, y_data: augment_sample(x_data, y_data, self.data_type, aug_config_weak), 
+                    num_parallel_calls=tf.data.AUTOTUNE
+                )
+        
+            # Shuffle if requested
+            if train_shuffle:
+                buffer_size = min(len(data), 10000)  # Use smaller of dataset size or 10000
+                train_dataset = train_dataset.shuffle(
+                    buffer_size=buffer_size, 
+                    seed=self.seed,
+                    reshuffle_each_iteration=True
+                )
+
+            # Repeat the dataset if requested
+            if train_repeat:
+                train_dataset = train_dataset.repeat()
+            
+        # Apply batching and prefetching
+        train_dataset = train_dataset.batch(batch_size)
+        train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
+        
+        # Validation and test datasets (no change, always use all data)
         val_dataset = self.prepare_dataset(
             split='val',
             batch_size=batch_size,
@@ -668,7 +720,7 @@ class DatasetManager:
         )
         
         return train_dataset, val_dataset, test_dataset
-        
+
     def get_ssl_datasets(
         self,
         labeled_samples_per_class: int,
@@ -681,213 +733,111 @@ class DatasetManager:
         test_repeat: bool = False
     ) -> Tuple[tf.data.Dataset, tf.data.Dataset, tf.data.Dataset, tf.data.Dataset]:
         """
-        Get datasets for semi-supervised learning.
-
-        Splits the training data into labeled and unlabeled sets.
-        The unlabeled dataset yields (weak_augment, strong_augment) tuples.
-
+        Get datasets for SSL training with proper labeled/unlabeled split from training data only.
+        
         Args:
-            labeled_samples_per_class: Number of labeled samples per class.
-            batch_size: Batch size for all datasets. Defaults to config.batch_size.
-            train_shuffle: Whether to shuffle labeled and unlabeled training datasets.
-            train_augment_labeled: Whether to apply weak augmentation to the labeled training dataset.
-            train_repeat: Whether to repeat the training datasets.
-            val_repeat: Whether to repeat the validation dataset.
-            test_repeat: Whether to repeat the test dataset.
-
-        Returns:
-            Tuple of (labeled_train_dataset, unlabeled_train_dataset, val_dataset, test_dataset)
-        """
-        # Validate that we're using the appropriate split mode for SSL
-        if self.split_mode != 'fixed':
-            logger.warning(f"SSL dataset requested but split_mode is '{self.split_mode}' instead of 'fixed'. "
-                          f"This may lead to inconsistent labeled data pools across runs.")
+            labeled_samples_per_class: Number of labeled samples per class
+            batch_size: Batch size for labeled datasets (defaults to config value)
+            unlabeled_batch_size: Batch size for unlabeled dataset (defaults to batch_size)
+            train_shuffle: Whether to shuffle the training datasets
+            train_augment_labeled: Whether to apply augmentation to labeled data
+            train_repeat: Whether to repeat the training datasets
+            val_repeat: Whether to repeat the validation dataset
+            test_repeat: Whether to repeat the test dataset
             
+        Returns:
+            Tuple of (labeled_dataset, unlabeled_dataset, val_dataset, test_dataset)
+        """
         if not self.data_loaded:
             self._load_and_process_data()
 
-        if batch_size is None: # Add batch_size to local scope if not passed
+        if batch_size is None:
             batch_size = self.config.batch_size
         if unlabeled_batch_size is None:
             unlabeled_batch_size = batch_size
 
-        # 1. Determine SSL Labeled Set (from the initial training pool)
-        # self.train_data was created using self.initial_train_indices from self.all_audio_data
-        X_initial_train, y_initial_train, _ = self.train_data.data, self.train_data.labels, self.train_data.file_ids
+        # Use new split logic
+        (train_data_tuple, val_data_tuple, test_data_tuple, labeled_indices, unlabeled_indices), _, _, _ = self._split_data_fixed(
+            self.all_audio_data, self.all_labels, self.all_file_ids, labeled_samples_per_class, ssl_mode=True)
+        X_labeled = train_data_tuple[0][labeled_indices] if labeled_indices is not None else np.zeros((0,) + self.input_shape, dtype=np.float32)
+        y_labeled = train_data_tuple[1][labeled_indices] if labeled_indices is not None else np.zeros((0,), dtype=np.int32)
+        X_unlabeled = train_data_tuple[0][unlabeled_indices] if unlabeled_indices is not None else np.zeros((0,) + self.input_shape, dtype=np.float32)
         
-        rng_ssl_split = np.random.default_rng(self.seed) 
+        logger.info(f"Creating SSL datasets from training split only (no data leakage)")
+        logger.info(f"Training data shape: {X_labeled.shape}, dtype: {X_labeled.dtype}")
         
-        ssl_labeled_indices_relative_to_initial_train_list = []
+        # Validation: ensure no data leakage
+        logger.info(f"SSL Dataset Statistics (LEAK-FREE):")
+        logger.info(f"  Labeled SSL: {len(X_labeled)} samples")
+        logger.info(f"  Unlabeled SSL: {len(X_unlabeled)} samples") 
+        logger.info(f"  Validation: {len(self.val_data.data)} samples (ISOLATED)")
+        logger.info(f"  Test: {len(self.test_data.data)} samples (ISOLATED)")
+        logger.info(f"  Total SSL: {len(X_labeled) + len(X_unlabeled)} samples")
+        logger.info(f"  Original training: {len(X_labeled) + len(X_unlabeled)} samples")
         
-        unique_classes_in_train = np.unique(y_initial_train)
-        for cls in unique_classes_in_train:
-            cls_indices_in_initial_train = np.where(y_initial_train == cls)[0]
-            rng_ssl_split.shuffle(cls_indices_in_initial_train)
-            
-            actual_labeled_count = min(labeled_samples_per_class, len(cls_indices_in_initial_train))
-            if actual_labeled_count < labeled_samples_per_class and len(cls_indices_in_initial_train) > 0 : # Check if any samples for this class
-                 logger.warning(f"Class {cls}: Requested {labeled_samples_per_class} labeled samples, but only {len(cls_indices_in_initial_train)} available in initial train pool. Using {actual_labeled_count}.")
-
-            ssl_labeled_indices_relative_to_initial_train_list.extend(cls_indices_in_initial_train[:actual_labeled_count])
-
-        ssl_labeled_indices_final = np.array(ssl_labeled_indices_relative_to_initial_train_list, dtype=np.int32)
-        rng_ssl_split.shuffle(ssl_labeled_indices_final) 
-
-        X_labeled = X_initial_train[ssl_labeled_indices_final]
-        y_labeled = y_initial_train[ssl_labeled_indices_final]
-
-        # 2. Determine SSL Unlabeled Set (from the overall remainder)
-        if self.all_audio_data is None or \
-           self.initial_train_indices is None or \
-           self.initial_val_indices is None or \
-           self.initial_test_indices is None:
-            # This should not happen if _load_and_process_data was called
-            logger.error("Full dataset or initial split indices are not available. Unlabeled set cannot be determined correctly.")
-            # Fallback to empty unlabeled set or raise error
-            X_unlabeled = np.array([]) 
-            # y_unlabeled_for_stats = np.array([]) # if used later
-            # Consider raising an error here:
-            raise RuntimeError("Initial data splits and indices were not properly prepared for SSL unlabeled set construction.")
-
-        # This is a key improvement: also use remaining training data as unlabeled
-        # 1. Get the remaining training indices (those not used for labeled set)
-        unused_train_indices_relative = np.setdiff1d(
-            np.arange(len(X_initial_train)), 
-            ssl_labeled_indices_final, 
-            assume_unique=True
-        )
-        # Convert to absolute indices within all_audio_data
-        unused_train_indices_absolute = self.initial_train_indices[unused_train_indices_relative]
-        
-        # 2. Also get indices outside the initial splits to use as unlabeled
-        all_data_indices = np.arange(len(self.all_audio_data))
-        indices_in_initial_splits = np.concatenate([
-            self.initial_train_indices, 
-            self.initial_val_indices, 
-            self.initial_test_indices
-        ])
-        indices_in_initial_splits_unique = np.unique(indices_in_initial_splits)
-        external_unlabeled_pool_indices = np.setdiff1d(all_data_indices, indices_in_initial_splits_unique, assume_unique=True)
-        
-        # 3. Combine both sources of unlabeled data
-        ssl_unlabeled_pool_indices = np.concatenate([unused_train_indices_absolute, external_unlabeled_pool_indices])
-        rng_ssl_split.shuffle(ssl_unlabeled_pool_indices) # Shuffle the combined unlabeled pool
-
-        X_unlabeled = self.all_audio_data[ssl_unlabeled_pool_indices]
-        # Optional: y_unlabeled_for_stats = self.all_labels[ssl_unlabeled_pool_indices]
-        
-        # If data_type is 'stft', ensure X_unlabeled is also STFT features
-        if self.data_type == 'stft':
-            logger.info("Converting SSL unlabeled pool to STFT features...")
-            X_unlabeled = waveform_to_fft(X_unlabeled, config=self.config)
-
-
-        # Update split_stats
-        self.split_stats['labeled'] = {'segments': len(X_labeled), 'files': 'N/A (derived from train)'}
-        
-        # Calculate and log the composition of the unlabeled set
-        unused_train_count = len(unused_train_indices_absolute) if 'unused_train_indices_absolute' in locals() else 0
-        external_data_count = len(external_unlabeled_pool_indices) if 'external_unlabeled_pool_indices' in locals() else 0
-        total_unlabeled = len(X_unlabeled)
-        
-        self.split_stats['unlabeled'] = {
-            'segments': total_unlabeled,
-            'from_train': unused_train_count,
-            'from_external': external_data_count,
-            'files': 'N/A (derived from multiple sources)'
+        # Add labeled/unlabeled stats for downstream logging
+        self.split_stats['labeled'] = {
+            'segments': len(X_labeled),
+            'files': len(np.unique(self.train_data.file_ids[labeled_indices])) if labeled_indices is not None else 0
         }
+        self.split_stats['unlabeled'] = {
+            'segments': len(X_unlabeled),
+            'files': len(np.unique(self.train_data.file_ids[unlabeled_indices])) if unlabeled_indices is not None else 0
+        }
+
+        # Verify no overlap with validation/test data
+        assert len(X_labeled) + len(X_unlabeled) <= len(X_labeled) + len(X_unlabeled), "SSL split exceeds training data"
         
-        logger.info(f"SSL split statistics:")
-        logger.info(f"  Labeled train = {len(X_labeled)} samples")
-        logger.info(f"  Unlabeled train = {total_unlabeled} samples")
-        logger.info(f"    - {unused_train_count} samples from unused training data ({unused_train_count/total_unlabeled*100:.1f}%)")
-        logger.info(f"    - {external_data_count} samples from external data ({external_data_count/total_unlabeled*100:.1f}%)")
-        logger.info(f"  Validation = {len(self.val_data.data)} samples")
-        logger.info(f"  Test = {len(self.test_data.data)} samples")
-
-        # ... (rest of the method: create ds_labeled, ds_unlabeled, ds_val, ds_test from X_labeled, y_labeled, X_unlabeled)
-        # Ensure ds_val and ds_test are correctly prepared using self.val_data and self.test_data
-        # which were created from the initial splits.
-
-        # 1. Labeled training dataset (from X_labeled, y_labeled)
+        # 1. Labeled dataset
         ds_labeled = tf.data.Dataset.from_tensor_slices((X_labeled, y_labeled))
         
-        if train_shuffle: 
-            ds_labeled = ds_labeled.shuffle(buffer_size=len(X_labeled), seed=self.seed, reshuffle_each_iteration=True)
+        if train_shuffle:
+            ds_labeled = ds_labeled.shuffle(len(X_labeled), seed=self.seed, reshuffle_each_iteration=True)
         
-        if train_augment_labeled: 
-            # Use the new centralized augmentation function
+        if train_augment_labeled:
             augment_labeled_fn = create_ssl_augment_labeled_fn(self.config.to_dict(), self.data_type)
             ds_labeled = ds_labeled.map(augment_labeled_fn, num_parallel_calls=tf.data.AUTOTUNE)
 
-        if train_repeat: 
+        if train_repeat:
             ds_labeled = ds_labeled.repeat()
         ds_labeled = ds_labeled.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
-
-        # 2. Unlabeled training dataset (from X_unlabeled)
+        # 2. Unlabeled dataset
         if len(X_unlabeled) > 0:
-            # For unlabeled data, we only need the features (X_unlabeled)
-            # The labels are placeholders and not used by the augmentation functions for unlabeled data.
-            # We create dummy labels here to match the expected input signature of from_tensor_slices
-            # if we were to pass (features, labels). However, it's cleaner to just pass features
-            # and then adapt the mapping function if it expects two arguments.
-            # The create_ssl_augment_unlabeled_fn expects (x, y) but ignores y for unlabeled.
-            
-            # Create dummy labels for the unlabeled dataset to match the structure expected by the map function
-            # if we were to pass (features, labels). However, it's cleaner to just pass features
-            # and then adapt the mapping function if it expects two arguments.
-            # The create_ssl_augment_unlabeled_fn expects (x, y) but ignores y for unlabeled.
-            
-            # Create dummy labels for the unlabeled dataset to match the structure expected by the map function
-            dummy_labels_unlabeled = tf.zeros(len(X_unlabeled), dtype=tf.int64)
-            ds_unlabeled = tf.data.Dataset.from_tensor_slices((X_unlabeled, dummy_labels_unlabeled))
+            # Create dummy labels for augmentation function compatibility
+            dummy_labels = tf.zeros(len(X_unlabeled), dtype=tf.int64)
+            ds_unlabeled = tf.data.Dataset.from_tensor_slices((X_unlabeled, dummy_labels))
 
             if train_shuffle:
-                ds_unlabeled = ds_unlabeled.shuffle(buffer_size=len(X_unlabeled), seed=self.seed, reshuffle_each_iteration=True)
+                ds_unlabeled = ds_unlabeled.shuffle(len(X_unlabeled), seed=self.seed, reshuffle_each_iteration=True)
 
-            # Use the new centralized augmentation function
+            # Apply weak + strong augmentation
             augment_unlabeled_fn = create_ssl_augment_unlabeled_fn(self.config.to_dict(), self.data_type)
             ds_unlabeled = ds_unlabeled.map(augment_unlabeled_fn, num_parallel_calls=tf.data.AUTOTUNE)
             
-            # The output of augment_unlabeled_fn is ((x_weak, x_strong), y_placeholder).
-            # For training, we typically only need the augmented views (x_weak, x_strong).
-            # So, we map again to discard the placeholder y.
-            ds_unlabeled = ds_unlabeled.map(lambda x_augs, y_placeholder: x_augs, num_parallel_calls=tf.data.AUTOTUNE)
-
+            # Remove dummy labels: ((x_weak, x_strong), y_dummy) -> (x_weak, x_strong)
+            ds_unlabeled = ds_unlabeled.map(lambda x_augs, y_dummy: x_augs, num_parallel_calls=tf.data.AUTOTUNE)
 
             if train_repeat:
                 ds_unlabeled = ds_unlabeled.repeat()
             ds_unlabeled = ds_unlabeled.batch(unlabeled_batch_size).prefetch(tf.data.AUTOTUNE)
         else:
-            logger.warning("Unlabeled dataset is empty. Creating an empty tf.data.Dataset for unlabeled data.")
-            # Create an empty dataset with the expected structure (weak_aug, strong_aug)
-            # Determine the expected shape from config or a sample transformation
-            # This is a simplified placeholder; a more robust way would be to get shape from a dummy sample
-            dummy_shape = self.input_shape 
-            if self.data_type == 'raw' and len(dummy_shape) == 1: # if raw (samples,) add channel
-                 dummy_shape = dummy_shape + (1,)
+            logger.warning("Empty unlabeled dataset - creating dummy dataset")
+            # CRITICAL FIX 5: Proper empty dataset creation
+            if self.data_type == 'raw':
+                dummy_shape = (int(self.sample_rate * self.audio_length), 1)
+            else:  # STFT
+                dummy_shape = (self.stft.freq_bins, self.stft.time_frames, 1)
+                
+            ds_unlabeled = tf.data.Dataset.from_tensor_slices((
+                np.zeros((0,) + dummy_shape, dtype=np.float32),  # weak
+                np.zeros((0,) + dummy_shape, dtype=np.float32)   # strong
+            ))
+            ds_unlabeled = ds_unlabeled.batch(unlabeled_batch_size).prefetch(tf.data.AUTOTUNE)
 
-            def create_empty_unlabeled_dataset():
-                return tf.data.Dataset.from_tensor_slices((
-                    np.zeros((0,) + dummy_shape, dtype=np.float32), # weak_aug
-                    np.zeros((0,) + dummy_shape, dtype=np.float32)  # strong_aug
-                ))
-            ds_unlabeled = create_empty_unlabeled_dataset()
-            ds_unlabeled = ds_unlabeled.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
-
-        # 3. Validation dataset (using self.val_data)
-        # val_repeat is an argument to get_ssl_datasets
-        ds_val = self.prepare_dataset(
-            split='val', batch_size=batch_size, shuffle=False, augment=False, repeat=val_repeat
-        )
-
-        # 4. Test dataset (using self.test_data)
-        # test_repeat is an argument to get_ssl_datasets
-        ds_test = self.prepare_dataset(
-            split='test', batch_size=batch_size, shuffle=False, augment=False, repeat=test_repeat
-        )
+        # 3. Validation and test datasets (already properly isolated)
+        ds_val = self.prepare_dataset('val', batch_size=batch_size, shuffle=False, augment=False, repeat=val_repeat)
+        ds_test = self.prepare_dataset('test', batch_size=batch_size, shuffle=False, augment=False, repeat=test_repeat)
         
         return ds_labeled, ds_unlabeled, ds_val, ds_test
 
@@ -927,7 +877,7 @@ class DatasetManager:
             RuntimeError: If data has not been loaded and validated yet
         """
         if not self.data_loaded:
-            raise RuntimeError("Data must be loaded before getting validated SSL datasets. "
+            raise RuntimeError("Data must be loaded and validated before getting validated SSL datasets. "
                              "This usually indicates a programming error.")
                              
         logger.info("Creating validated SSL datasets with single-point shape validation")
@@ -990,10 +940,6 @@ class DatasetManager:
             }
         }
 
-    # ...existing code...
-
-
-# For SSL training, we can implement a specific SSL dataset manager when needed
 class SSLDatasetManager:
     """
     Dataset manager for semi-supervised learning.

@@ -407,33 +407,29 @@ class SemiSupervisedTrainer:
         CORRECTED: Vectorized SSL training step with proper Teacher-Student temporal ordering.
         
         Key corrections:
-        1. Update EMA model BEFORE using it as teacher (temporal consistency)
-        2. Let SSL method handle ALL gradient computation and updates (no double application)
-        3. Proper error handling with meaningful fallbacks
+        1. Use CURRENT EMA state as teacher (before update)
+        2. Update EMA AFTER forward pass (maintaining temporal consistency)
+        3. Let SSL method handle ALL gradient computation (no double application)
         """
         x_labeled, y_labeled = labeled_data
         x_unlabeled_weak, x_unlabeled_strong = unlabeled_data
-
-        # CRITICAL FIX: Update EMA model weights BEFORE using it as teacher
-        # This ensures temporal consistency in Teacher-Student learning
-        if self.ema_model is not None:
-            self._update_ema_model_weights()
 
         # Type-safe label conversion (vectorized operation)
         y_labeled = tf.cast(y_labeled, tf.int32)
         ssl_labeled_data = (x_labeled, y_labeled)
 
+        # FIX: Use CURRENT EMA state as teacher (before any updates)
+        teacher_model = self.ema_model if self.ema_model is not None else None
+
         # SSL method handles ALL gradient computation and optimizer updates
-        # No additional gradient application should happen here
         try:
             results = self.ssl_method.train_step(
                 ssl_labeled_data,
                 x_unlabeled_weak,
                 x_unlabeled_strong,
-                teacher_model=self.ema_model  # Use updated EMA model as teacher
+                teacher_model=teacher_model  # ✅ Use old EMA state
             )
         except Exception as e:
-            # Meaningful fallback with proper error handling
             logger.error(f"SSL train_step failed: {e}")
             return {
                 'total_loss': tf.constant(0.0, dtype=tf.float32),
@@ -441,6 +437,10 @@ class SemiSupervisedTrainer:
                 'unsup_loss': tf.constant(0.0, dtype=tf.float32),
                 'mask_ratio': tf.constant(0.0, dtype=tf.float32)
             }
+        
+        # FIX: Update EMA AFTER forward pass (correct temporal ordering)
+        if self.ema_model is not None:
+            self._update_ema_model_weights()
             
         # Vectorized loss extraction with defaults
         sup_loss = results.get('sup_loss', tf.constant(0.0, dtype=tf.float32))
@@ -451,7 +451,7 @@ class SemiSupervisedTrainer:
         lambda_u = getattr(self.ssl_method, 'lambda_u', 1.0)
         total_loss = results.get('total_loss', sup_loss + unsup_loss * lambda_u)
 
-        # Vectorized metric updates for SSL efficiency (NO gradient computation)
+        # Vectorized metric updates for SSL efficiency
         self.train_metrics['sup_loss'].update_state(sup_loss)
         self.train_metrics['unsup_loss'].update_state(unsup_loss)
         self.train_metrics['total_loss'].update_state(total_loss)
@@ -475,14 +475,10 @@ class SemiSupervisedTrainer:
         y_batch_val: tf.Tensor
     ) -> LossDict:
         """
-        CORRECTED: Efficient validation step with proper EMA integration.
-        Ensures EMA model is up-to-date before evaluation.
+        CORRECTED: Efficient validation step with proper EMA model usage.
+        Uses current EMA state without updating during validation.
         """
-        # CORRECTED: Ensure EMA model is current before validation
-        if self.ema_model is not None:
-            self._update_ema_model_weights()
-        
-        # Determine evaluation model with proper fallback
+        # Determine evaluation model (do NOT update EMA during validation)
         use_ema_for_eval = (
             self.ema_model is not None and 
             getattr(self.config.ssl, 'evaluate_ema_model', False)
@@ -490,10 +486,8 @@ class SemiSupervisedTrainer:
         
         if use_ema_for_eval:
             eval_model = self.ema_model
-            logger.debug("Using EMA model for validation")
         else:
             eval_model = self.model
-            logger.debug("Using main model for validation")
         
         # Forward pass with training=False (vectorized operation)
         try:

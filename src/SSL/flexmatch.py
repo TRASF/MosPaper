@@ -13,10 +13,6 @@ from typing import Tuple, Dict, Union, Optional, Any, List, cast
 # Configure logger
 logger = logging.getLogger(__name__)
 
-def _var_key(var):
-    """Get the key for storing optimizer slots."""
-    return var.experimental_ref() if hasattr(var, 'experimental_ref') else var.ref()
-
 class FlexMatch:
     
     def __init__(
@@ -73,10 +69,9 @@ class FlexMatch:
         self.p_target = p_target_dist if p_target_dist is not None else tf.ones(num_classes, dtype=tf.float32) / float(num_classes)
         self.p_model = tf.Variable(tf.zeros(num_classes, dtype=tf.float32), trainable=False, name="p_model_dist")
 
-        # FlexMatch specific: class selection rate (η_c in the paper)
-        # Initialized to 0.5 to allow for reasonable initial thresholds
+        initial_rates = tf.random.uniform([num_classes], minval=0.3, maxval=0.7, dtype=tf.float32)
         self.class_selection_rate = tf.Variable(
-            tf.ones(num_classes, dtype=tf.float32) * 0.5, 
+            initial_rates,
             trainable=False, 
             name="class_selection_rate"
         )
@@ -297,46 +292,41 @@ class FlexMatch:
         logits_weak: tf.Tensor
     ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
         """
-        Calculate FlexMatch unsupervised loss with curriculum pseudo-labeling.
-        
-        Args:
-            logits_strong: Logits from strongly augmented unlabeled samples
-            logits_weak: Logits from weakly augmented unlabeled samples (gradients stopped)
-            
-        Returns:
-            Tuple containing:
-            - unsup_loss: Weighted unsupervised loss
-            - mask_ratio: Proportion of samples used in loss calculation
-            - pseudo_labels: Predicted class indices from weak augmentations
-            - selected_mask: Binary mask of samples selected by confidence threshold
-            - pseudo_accuracy: Agreement between weak pseudo-labels and strong predictions
+        FIXED: Calculate FlexMatch unsupervised loss with correct curriculum thresholding.
         """
-        # Generate pseudo-labels from weak augmentations (no gradients)
+        # Generate pseudo-labels from weak augmentations
         pseudo_probs = tf.nn.softmax(logits_weak / self.T, axis=-1)
         
         # Apply distribution alignment if enabled
         if self.use_DA and tf.reduce_sum(self.p_model) > 1e-6:
-            # Calculate aligned probabilities: p_align = p * (p_target / p_model)
-            p_model_safe = tf.maximum(self.p_model, 1e-8)  # Prevent division by zero
+            p_model_safe = tf.maximum(self.p_model, 1e-8)
             alignment_ratio = self.p_target / p_model_safe
             pseudo_probs = pseudo_probs * alignment_ratio
-            # Renormalize to ensure valid probability distribution
             pseudo_probs = pseudo_probs / (tf.reduce_sum(pseudo_probs, axis=-1, keepdims=True) + 1e-9)
         
         # Get confidence and predicted class
         max_probs = tf.reduce_max(pseudo_probs, axis=-1)
         pseudo_labels = tf.argmax(pseudo_probs, axis=-1)
         
-        # FlexMatch curriculum thresholding (key innovation)
+        # FIXED: FlexMatch curriculum thresholding (CORRECT FORMULA)
         sample_selection_rates = tf.gather(self.class_selection_rate, pseudo_labels)
         avg_selection_rate = tf.reduce_mean(self.class_selection_rate)
         
-        # Calculate adaptive thresholds: τ_c = τ * (η_c / η_avg)
-        # Clamp to prevent extreme thresholds
+        # Paper formula: τ_c = τ * sqrt(max(η_c, δ) / max(η̄, δ))
+        delta = 0.05  # Small constant to prevent division by zero
+        
+        # Ensure both numerator and denominator are at least delta
+        safe_sample_rates = tf.maximum(sample_selection_rates, delta)
+        safe_avg_rate = tf.maximum(avg_selection_rate, delta)
+        
+        # Apply square root for curriculum smoothing
+        flex_thresholds = self.confidence_threshold * tf.sqrt(safe_sample_rates / safe_avg_rate)
+        
+        # Clamp to reasonable bounds (more restrictive than before)
         flex_thresholds = tf.clip_by_value(
-            self.confidence_threshold * (sample_selection_rates / (avg_selection_rate + 1e-8)),
-            0.1,  # Minimum threshold
-            self.confidence_threshold  # Maximum threshold
+            flex_thresholds, 
+            0.5,  # Higher minimum threshold 
+            0.98  # Slightly lower maximum threshold
         )
         
         # Apply flexible thresholds for loss masking
@@ -365,12 +355,10 @@ class FlexMatch:
         # Calculate mask ratio for monitoring
         mask_ratio = tf.reduce_mean(flex_mask)
         
-        # Calculate pseudo-label accuracy (agreement between weak and strong predictions)
+        # Calculate pseudo-label accuracy
         strong_probs = tf.nn.softmax(logits_strong, axis=-1)
         strong_predictions = tf.argmax(strong_probs, axis=-1)
         correct_predictions = tf.cast(tf.equal(pseudo_labels, strong_predictions), tf.float32)
-        
-        # Average accuracy over all samples (not just masked ones)
         pseudo_accuracy = tf.reduce_mean(correct_predictions)
         
         return unsup_loss, mask_ratio, pseudo_labels, fixed_threshold_mask, pseudo_accuracy
