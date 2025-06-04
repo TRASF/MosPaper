@@ -601,15 +601,6 @@ class DatasetManager:
         # Create TensorFlow dataset from numpy arrays
         dataset = tf.data.Dataset.from_tensor_slices((data, labels))
         
-        # Apply augmentation if requested (only for training)
-        if augment and split == 'train':
-            # Directly use augmentation functions from the augmentation module
-            aug_config_weak = get_augmentation_config(self.config.to_dict(), 'weak')
-            dataset = dataset.map(
-                lambda x_data, y_data: augment_sample(x_data, y_data, self.data_type, aug_config_weak), 
-                num_parallel_calls=tf.data.AUTOTUNE
-            )
-        
         # Shuffle if requested
         if shuffle:
             buffer_size = min(len(data), 10000)  # Use smaller of dataset size or 10000
@@ -676,27 +667,18 @@ class DatasetManager:
             # Create TensorFlow dataset from numpy arrays
             train_dataset = tf.data.Dataset.from_tensor_slices((data, labels))
         
-            # Apply augmentation if requested (only for training)
-            if train_augment:
-                # Directly use augmentation functions from the augmentation module
-                aug_config_weak = get_augmentation_config(self.config.to_dict(), 'weak')
-                train_dataset = train_dataset.map(
-                    lambda x_data, y_data: augment_sample(x_data, y_data, self.data_type, aug_config_weak), 
-                    num_parallel_calls=tf.data.AUTOTUNE
-                )
-        
-            # Shuffle if requested
-            if train_shuffle:
-                buffer_size = min(len(data), 10000)  # Use smaller of dataset size or 10000
-                train_dataset = train_dataset.shuffle(
-                    buffer_size=buffer_size, 
-                    seed=self.seed,
-                    reshuffle_each_iteration=True
-                )
+        # Shuffle if requested
+        if train_shuffle:
+            buffer_size = min(len(data), 10000)  # Use smaller of dataset size or 10000
+            train_dataset = train_dataset.shuffle(
+                buffer_size=buffer_size, 
+                seed=self.seed,
+                reshuffle_each_iteration=True
+            )
 
-            # Repeat the dataset if requested
-            if train_repeat:
-                train_dataset = train_dataset.repeat()
+        # Repeat the dataset if requested
+        if train_repeat:
+            train_dataset = train_dataset.repeat()
             
         # Apply batching and prefetching
         train_dataset = train_dataset.batch(batch_size)
@@ -794,29 +776,32 @@ class DatasetManager:
         if train_shuffle:
             ds_labeled = ds_labeled.shuffle(len(X_labeled), seed=self.seed, reshuffle_each_iteration=True)
         
-        if train_augment_labeled:
-            augment_labeled_fn = create_ssl_augment_labeled_fn(self.config.to_dict(), self.data_type)
-            ds_labeled = ds_labeled.map(augment_labeled_fn, num_parallel_calls=tf.data.AUTOTUNE)
-
         if train_repeat:
             ds_labeled = ds_labeled.repeat()
         ds_labeled = ds_labeled.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
-        # 2. Unlabeled dataset
+        # 2. Unlabeled dataset with SSL augmentation
         if len(X_unlabeled) > 0:
+            # Debug: Check the actual shape of X_unlabeled
+            logger.info(f"X_unlabeled shape: {X_unlabeled.shape}, dtype: {X_unlabeled.dtype}")
+            logger.info(f"Expected input shape: {self.input_shape}")
+            
             # Create dummy labels for augmentation function compatibility
             dummy_labels = tf.zeros(len(X_unlabeled), dtype=tf.int64)
             ds_unlabeled = tf.data.Dataset.from_tensor_slices((X_unlabeled, dummy_labels))
 
+            # Debug: Check the dataset element spec
+            logger.info(f"Unlabeled dataset element spec: {ds_unlabeled.element_spec}")
+
+            # Apply SSL augmentation to create weak and strong augmented versions
+            ssl_augment_fn = create_ssl_augment_unlabeled_fn(
+                config_dict=getattr(self.config, 'augmentation', {}), 
+                data_type=self.data_type
+            )
+            ds_unlabeled = ds_unlabeled.map(ssl_augment_fn, num_parallel_calls=tf.data.AUTOTUNE)
+
             if train_shuffle:
                 ds_unlabeled = ds_unlabeled.shuffle(len(X_unlabeled), seed=self.seed, reshuffle_each_iteration=True)
-
-            # Apply weak + strong augmentation
-            augment_unlabeled_fn = create_ssl_augment_unlabeled_fn(self.config.to_dict(), self.data_type)
-            ds_unlabeled = ds_unlabeled.map(augment_unlabeled_fn, num_parallel_calls=tf.data.AUTOTUNE)
-            
-            # Remove dummy labels: ((x_weak, x_strong), y_dummy) -> (x_weak, x_strong)
-            ds_unlabeled = ds_unlabeled.map(lambda x_augs, y_dummy: x_augs, num_parallel_calls=tf.data.AUTOTUNE)
 
             if train_repeat:
                 ds_unlabeled = ds_unlabeled.repeat()
