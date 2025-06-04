@@ -1,7 +1,5 @@
 """
-FixMatch implementation for semi-supervised learning of mosquito wingbeat classification.
-Implementation follows Sohn et al. "FixMatch: Simplifying Semi-Supervised Learning 
-with Consistency and Confidence" (NeurIPS 2020).
+Optimized FixMatch implementation with proper gradient flow and EMA handling.
 """
 
 import tensorflow as tf
@@ -24,7 +22,7 @@ class FixMatch:
     Key features:
     1. Uses weak and strong augmentations for consistency regularization
     2. Applies confidence thresholding for pseudo-labeling
-    3. Combines supervised and unsupervised losses
+    3. Combines supervised and unsupervised losses with unified gradient flow
     """
     
     def __init__(
@@ -34,7 +32,8 @@ class FixMatch:
         confidence_threshold: float, 
         lambda_u: float = 1.0,
         T: float = 1.0,
-        optimizer: Optional[tfk.optimizers.Optimizer] = None  # CHANGED: Accept optimizer instead of learning_rate
+        optimizer: Optional[tfk.optimizers.Optimizer] = None,
+        ema_decay: float = 0.999
     ) -> None:
         """
         Initialize FixMatch trainer.
@@ -45,7 +44,8 @@ class FixMatch:
             confidence_threshold: Threshold for pseudo-labeling
             lambda_u: Weight for unsupervised loss
             T: Temperature for sharpening pseudo-labels
-            learning_rate: Learning rate for optimizer
+            optimizer: Optimizer for model updates (will be provided by trainer)
+            ema_decay: Decay rate for EMA teacher model (if used)
         """
         self.model = model
         
@@ -54,18 +54,22 @@ class FixMatch:
             self.optimizer = optimizer
         else:
             self.optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+            logger.warning("Using default optimizer. For best results, provide optimizer from trainer.")
             
-        # Rest of your initialization code...
+        # Loss functions - standard categorical cross-entropy
         self.labeled_loss_fn = tfk.losses.CategoricalCrossentropy(from_logits=True)
         self.unlabeled_loss_fn = tfk.losses.CategoricalCrossentropy(
             from_logits=True, reduction=tfk.losses.Reduction.NONE
         )
+        
+        # Core SSL parameters
         self.num_classes = num_classes
         self.confidence_threshold = confidence_threshold
         self.lambda_u = lambda_u
         self.T = T
+        self.ema_decay_rate = ema_decay
 
-        # Metrics
+        # Metrics for monitoring
         self.sup_loss_metric = tfk.metrics.Mean(name='sup_loss')
         self.unsup_loss_metric = tfk.metrics.Mean(name='unsup_loss')
         self.total_loss_metric = tfk.metrics.Mean(name='total_loss')
@@ -83,7 +87,7 @@ class FixMatch:
         teacher_model: Optional[tfk.Model] = None
     ) -> Dict[str, tf.Tensor]:
         """
-        Execute a single training step implementing FixMatch with proper unified gradient flow.
+        Execute a single training step with proper unified gradient flow.
         """
         x_labeled, y_labeled = labeled_data
         
@@ -95,46 +99,43 @@ class FixMatch:
         # Convert labels to one-hot
         y_labeled_one_hot = tf.one_hot(y_labeled, depth=self.num_classes)
         
-        # SINGLE gradient tape for unified training (CRITICAL FIX)
+        # UNIFIED gradient tape for proper backpropagation
         with tf.GradientTape() as tape:
-            # Supervised loss
+            # Supervised loss from labeled samples
             logits_labeled = self.model(x_labeled, training=True)
             sup_loss = self.labeled_loss_fn(y_labeled_one_hot, logits_labeled)
             
             # Generate pseudo-labels using weak augmentations
             if teacher_model is not None:
-                # Teacher-Student: use EMA teacher for pseudo-labels
+                # Use EMA teacher for pseudo-labels (no gradients)
                 logits_weak = teacher_model(x_unlabeled_weak, training=False)
-                logits_weak = tf.stop_gradient(logits_weak)
             else:
                 # Self-training: use current model for pseudo-labels
                 logits_weak = self.model(x_unlabeled_weak, training=True)
-                logits_weak = tf.stop_gradient(logits_weak)
             
-            # Process strongly augmented samples with student model
+            # Stop gradients for pseudo-label generation (critical for stability)
+            logits_weak = tf.stop_gradient(logits_weak)
+            
+            # Process strongly augmented samples (with gradients)
             logits_strong = self.model(x_unlabeled_strong, training=True)
             
-            # Calculate consistency loss
+            # Calculate consistency loss with confidence thresholding
             unsup_loss, mask_ratio, pseudo_labels, mask, pseudo_accuracy = self._consistency_loss(
-                logits_strong, 
-                logits_weak
+                logits_strong, logits_weak
             )
             
-            # UNIFIED LOSS - This is crucial for proper SSL training
+            # UNIFIED LOSS - combine supervised and unsupervised components
             total_loss = sup_loss + self.lambda_u * unsup_loss
         
-        # SINGLE gradient computation and application
+        # Calculate gradients from unified loss
         gradients = tape.gradient(total_loss, self.model.trainable_variables)
         
         # Optional gradient clipping
         if hasattr(self, 'clip_grad_norm') and self.clip_grad_norm > 0:
             gradients, _ = tf.clip_by_global_norm(gradients, self.clip_grad_norm)
         
+        # Apply gradients to update model
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-        
-        # Update EMA teacher if provided
-        if teacher_model is not None and hasattr(self, 'ema_decay_rate'):
-            self._update_ema_teacher(teacher_model)
         
         # Update metrics
         self.sup_loss_metric.update_state(sup_loss)
@@ -149,8 +150,17 @@ class FixMatch:
             "total_loss": total_loss,
             "mask_ratio": mask_ratio,
             "pseudo_accuracy": pseudo_accuracy,
-            "learning_rate": self.optimizer.learning_rate,
+            "learning_rate": self._get_optimizer_lr(),
         }
+    
+    def _get_optimizer_lr(self) -> tf.Tensor:
+        """Safely extract current learning rate from optimizer."""
+        lr = self.optimizer.learning_rate
+        if isinstance(lr, tf.Variable):
+            return lr
+        elif callable(lr):
+            return lr(self.optimizer.iterations)
+        return tf.convert_to_tensor(lr)
 
     @tf.function  
     def _consistency_loss(
@@ -159,14 +169,14 @@ class FixMatch:
         logits_weak: tf.Tensor
     ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
         """
-        Calculate FixMatch consistency loss with proper error handling.
+        Calculate consistency loss with confidence thresholding.
         """
         # Generate pseudo-labels with temperature sharpening
         pseudo_probs = tf.nn.softmax(logits_weak / self.T, axis=-1) 
         max_probs = tf.reduce_max(pseudo_probs, axis=-1)
         pseudo_labels = tf.argmax(pseudo_probs, axis=-1)
         
-        # Get predictions from strong augmentations
+        # Get predictions from strong augmentations for accuracy calculation
         strong_probs = tf.nn.softmax(logits_strong, axis=-1)
         strong_predictions = tf.argmax(strong_probs, axis=-1)
         
@@ -179,10 +189,11 @@ class FixMatch:
         # Calculate per-sample loss
         per_sample_loss = self.unlabeled_loss_fn(pseudo_labels_one_hot, logits_strong)
         
-        # Apply mask and calculate average
+        # Apply mask and calculate average with proper error handling
         masked_loss = per_sample_loss * mask
         mask_sum = tf.reduce_sum(mask)
         
+        # Handle empty mask case to avoid NaN
         unsup_loss = tf.cond(
             mask_sum > 0,
             lambda: tf.reduce_sum(masked_loss) / mask_sum,
@@ -197,24 +208,13 @@ class FixMatch:
         
         return unsup_loss, mask_ratio, pseudo_labels, mask, pseudo_accuracy
 
-    def _update_ema_teacher(self, teacher_model: tfk.Model) -> None:
-        """Update EMA teacher model weights."""
-        if not hasattr(self, 'ema_decay_rate'):
-            self.ema_decay_rate = 0.999
-        
-        for teacher_param, student_param in zip(teacher_model.trainable_variables, 
-                                            self.model.trainable_variables):
-            teacher_param.assign(
-                self.ema_decay_rate * teacher_param + 
-                (1.0 - self.ema_decay_rate) * student_param
-            )
-
     def reset_metrics(self) -> None:
         """Reset all metrics."""
         self.sup_loss_metric.reset_states()
         self.unsup_loss_metric.reset_states()
         self.total_loss_metric.reset_states()
         self.mask_ratio_metric.reset_states()
+        self.pseudo_label_accuracy_metric.reset_states()
 
     def get_metrics(self) -> Dict[str, tf.Tensor]:
         """Get current metrics values as a dictionary."""
@@ -223,10 +223,9 @@ class FixMatch:
             "unsup_loss": self.unsup_loss_metric.result(),
             "total_loss": self.total_loss_metric.result(),
             "mask_ratio": self.mask_ratio_metric.result(),
+            "pseudo_accuracy": self.pseudo_label_accuracy_metric.result(),
         }
     
     def on_epoch_end(self) -> None:
-        """Reset metrics and optimizer state at the end of each epoch."""
-        # Reset metrics
+        """Reset metrics at the end of each epoch."""
         self.reset_metrics()
-

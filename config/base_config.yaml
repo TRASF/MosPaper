@@ -115,7 +115,7 @@ ssl:
   T: 0.5
   # Confidence threshold for pseudo-labeling
   confidence_threshold: 0.9
-  ema_decay: 0.999
+  ema_decay: 0.9999
   evaluate_ema_model: true
   lambda_u: 0.5
   mu: 2

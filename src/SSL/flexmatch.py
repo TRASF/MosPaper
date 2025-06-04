@@ -1,7 +1,5 @@
 """
-FlexMatch implementation for semi-supervised learning of mosquito wingbeat classification.
-Implementation follows Zhang et al. "FlexMatch: Boosting Semi-Supervised Learning 
-with Curriculum Pseudo Labeling" (NeurIPS 2021).
+Optimized FlexMatch implementation with correct curriculum thresholding and distribution alignment.
 """
 
 import tensorflow as tf
@@ -22,13 +20,13 @@ class FlexMatch:
         confidence_threshold: float, 
         lambda_u: float = 1.0,
         T: float = 1.0, 
-        ema_decay: float = 0.9,
+        ema_decay: float = 0.999,
         use_DA: bool = False, 
         p_target_dist: Optional[tf.Tensor] = None,
         optimizer: Optional[tfk.optimizers.Optimizer] = None  
     ) -> None:
         """
-        Initialize FlexMatch trainer.
+        Initialize FlexMatch trainer with correct curriculum learning implementation.
         
         Args:
             model: Neural network model for classification
@@ -42,18 +40,17 @@ class FlexMatch:
             optimizer: Optimizer for training (creates Adam if None)
         """
         self.model = model
-        
-        # CRITICAL FIX: Store num_classes as instance attribute
         self.num_classes = num_classes
-        self.confidence_threshold = confidence_threshold  # Store this too
-        self.lambda_u = lambda_u  # Store this too
-        self.T = T  # Store this too
+        self.confidence_threshold = confidence_threshold
+        self.lambda_u = lambda_u
+        self.T = T
         
         # Use provided optimizer or create default Adam
         if optimizer is not None:
             self.optimizer = optimizer
         else:
             self.optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+            logger.warning("Using default optimizer. For best results, provide optimizer from trainer.")
             
         # Loss functions
         self.labeled_loss_fn = tfk.losses.CategoricalCrossentropy(from_logits=True)
@@ -69,7 +66,9 @@ class FlexMatch:
         self.p_target = p_target_dist if p_target_dist is not None else tf.ones(num_classes, dtype=tf.float32) / float(num_classes)
         self.p_model = tf.Variable(tf.zeros(num_classes, dtype=tf.float32), trainable=False, name="p_model_dist")
 
-        initial_rates = tf.random.uniform([num_classes], minval=0.3, maxval=0.7, dtype=tf.float32)
+        # FIXED: Initialize class selection rates to a sensible value (half the confidence threshold)
+        # This ensures curriculum learning starts with reasonable thresholds
+        initial_rates = tf.ones([num_classes], dtype=tf.float32) * (self.confidence_threshold * 0.5)
         self.class_selection_rate = tf.Variable(
             initial_rates,
             trainable=False, 
@@ -108,6 +107,10 @@ class FlexMatch:
             # Calculate current batch distribution
             current_batch_dist = tf.reduce_mean(pseudo_probs, axis=0)
             
+            # Ensure we don't have any zeros that would cause division issues
+            current_batch_dist = tf.maximum(current_batch_dist, 1e-8)
+            current_batch_dist = current_batch_dist / tf.reduce_sum(current_batch_dist)
+            
             # Initialize or update with exponential moving average
             if tf.reduce_sum(tf.abs(self.p_model)) < 1e-8:
                 # First update: initialize with current distribution
@@ -115,16 +118,18 @@ class FlexMatch:
                 logger.info("Initialized p_model distribution for Distribution Alignment")
             else:
                 # EMA update: p_model = α * p_model + (1 - α) * current_batch
-                decay_rate = self.ema_decay
-                updated_dist = decay_rate * self.p_model + (1.0 - decay_rate) * current_batch_dist
+                updated_dist = self.ema_decay * self.p_model + (1.0 - self.ema_decay) * current_batch_dist
+                
+                # Normalize to ensure it's a valid distribution
+                updated_dist = updated_dist / tf.reduce_sum(updated_dist)
                 self.p_model.assign(updated_dist)
 
     def update_curriculum(self) -> None:
         """
-        Update class selection rates based on accumulated counts.
+        FIXED: Update class selection rates based on accumulated counts.
         Formula: η_c = S_c / N_c (ratio of selected pseudo-labels per class)
         
-        This should be called at the end of each epoch.
+        This follows the FlexMatch paper algorithm for dynamic thresholding.
         """
         N_counts = tf.cast(self.pseudo_label_total_count, tf.float32)
         S_counts = tf.cast(self.pseudo_label_selected_count, tf.float32)
@@ -135,8 +140,18 @@ class FlexMatch:
         # Calculate η_c = S_c / N_c for each class
         new_selection_rates = S_counts / (N_counts + epsilon)
         
-        # Assign to class_selection_rate with clipping for stability
-        self.class_selection_rate.assign(tf.clip_by_value(new_selection_rates, 0.25, self.confidence_threshold))
+        # FIXED: Ensure sensible bounds on selection rates (0.05 to confidence_threshold)
+        # Prevent extremely low rates that would accept noise
+        new_selection_rates = tf.clip_by_value(
+            new_selection_rates, 
+            0.05,  # Minimum selection rate
+            self.confidence_threshold  # Maximum is base threshold
+        )
+        
+        # Assign to class_selection_rate with more stable update (EMA)
+        # This prevents wild fluctuations between epochs
+        updated_rates = 0.8 * self.class_selection_rate + 0.2 * new_selection_rates
+        self.class_selection_rate.assign(updated_rates)
         
         logger.info(f"Updated class selection rates (η_c): {self.class_selection_rate.numpy()}")
         
@@ -153,23 +168,14 @@ class FlexMatch:
         teacher_model: Optional[tfk.Model] = None
     ) -> Dict[str, tf.Tensor]:
         """
-        Execute a single training step implementing FlexMatch with proper gradient flow.
-        
-        Args:
-            labeled_data: Tuple of (inputs, targets) for labeled samples
-            x_unlabeled_weak: Weakly augmented unlabeled samples
-            x_unlabeled_strong: Strongly augmented unlabeled samples
-            teacher_model: Optional EMA model to use as teacher for generating pseudo-labels
-            
-        Returns:
-            Dictionary of metrics for this step
+        Execute a single training step with proper gradient flow.
         """
         x_labeled, y_labeled = labeled_data
         
         # Convert labels to one-hot
         y_labeled_one_hot = tf.one_hot(y_labeled, depth=self.num_classes)
         
-        # Single gradient tape for unified training
+        # UNIFIED gradient tape for proper backpropagation
         with tf.GradientTape() as tape:
             # Forward pass for labeled data (supervised loss)
             logits_labeled = self.model(x_labeled, training=True)
@@ -179,13 +185,14 @@ class FlexMatch:
             if teacher_model is not None:
                 # Teacher-Student approach: use EMA teacher for pseudo-labels
                 logits_weak = teacher_model(x_unlabeled_weak, training=False)
-                logits_weak = tf.stop_gradient(logits_weak)  # No gradients through teacher
             else:
                 # Self-training approach: use current model for pseudo-labels
                 logits_weak = self.model(x_unlabeled_weak, training=True)
-                logits_weak = tf.stop_gradient(logits_weak)  # Stop gradients for pseudo-label generation
             
-            # Forward pass for strongly augmented samples (always use student model)
+            # Stop gradients for pseudo-label generation
+            logits_weak = tf.stop_gradient(logits_weak)
+            
+            # Forward pass for strongly augmented samples
             logits_strong = self.model(x_unlabeled_strong, training=True)
             
             # Calculate FlexMatch unsupervised loss
@@ -193,21 +200,18 @@ class FlexMatch:
                 logits_strong, logits_weak
             )
             
-            # Combined loss (this is crucial for proper SSL training)
+            # Combined loss (unified gradient flow)
             total_loss = sup_loss + self.lambda_u * unsup_loss
         
-        # Single gradient computation and optimizer update
+        # Calculate gradients
         gradients = tape.gradient(total_loss, self.model.trainable_variables)
         
-        # Apply gradient clipping if needed (common in SSL training)
+        # Apply gradient clipping if needed
         if hasattr(self, 'clip_grad_norm') and self.clip_grad_norm > 0:
             gradients, _ = tf.clip_by_global_norm(gradients, self.clip_grad_norm)
         
+        # Apply gradients
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-        
-        # Update EMA teacher model if provided
-        if teacher_model is not None and hasattr(self, 'ema_decay_rate'):
-            self._update_ema_teacher(teacher_model)
         
         # Update distribution alignment statistics
         pseudo_probs = tf.nn.softmax(logits_weak / self.T, axis=-1)
@@ -229,31 +233,22 @@ class FlexMatch:
             "total_loss": total_loss,
             "mask_ratio": mask_ratio,
             "pseudo_accuracy": pseudo_accuracy,
-            "learning_rate": self.optimizer.learning_rate,
+            "learning_rate": self._get_optimizer_lr(),
             "class_selection_rates": self.class_selection_rate
         }
-
-    def _update_ema_teacher(self, teacher_model: tfk.Model) -> None:
-        """
-        Update EMA teacher model weights using exponential moving average.
         
-        Args:
-            teacher_model: Teacher model to update with EMA weights
-        """
-        if not hasattr(self, 'ema_decay_rate'):
-            self.ema_decay_rate = 0.999  # Default EMA decay rate
-        
-        # Update teacher weights: θ_teacher = α * θ_teacher + (1 - α) * θ_student
-        for teacher_param, student_param in zip(teacher_model.trainable_variables, 
-                                            self.model.trainable_variables):
-            teacher_param.assign(
-                self.ema_decay_rate * teacher_param + 
-                (1.0 - self.ema_decay_rate) * student_param
-            )
+    def _get_optimizer_lr(self) -> tf.Tensor:
+        """Safely extract current learning rate from optimizer."""
+        lr = self.optimizer.learning_rate
+        if isinstance(lr, tf.Variable):
+            return lr
+        elif callable(lr):
+            return lr(self.optimizer.iterations)
+        return tf.convert_to_tensor(lr)
 
     def _update_class_statistics(self, pseudo_labels: tf.Tensor, selected: tf.Tensor) -> None:
         """
-        Update counters for curriculum pseudo-labeling using vectorized operations.
+        FIXED: Update counters for curriculum pseudo-labeling with proper atomic operations.
         
         Args:
             pseudo_labels: Pseudo-labels assigned to unlabeled samples (class indices)
@@ -263,25 +258,28 @@ class FlexMatch:
         pseudo_labels = tf.cast(pseudo_labels, tf.int32)
         selected = tf.cast(selected, tf.int32)
         
-        # Count total pseudo-labels per class using bincount
+        # Count total pseudo-labels per class
         total_counts = tf.math.bincount(
             pseudo_labels, 
             minlength=self.num_classes, 
-            maxlength=self.num_classes,
             dtype=tf.int32
         )
         
         # Count selected pseudo-labels per class
         # Only count samples where selected == 1
         selected_indices = tf.boolean_mask(pseudo_labels, tf.cast(selected, tf.bool))
-        selected_counts = tf.math.bincount(
-            selected_indices,
-            minlength=self.num_classes,
-            maxlength=self.num_classes, 
-            dtype=tf.int32
-        )
         
-        # Update the variables
+        # Handle empty case to avoid errors
+        if tf.size(selected_indices) > 0:
+            selected_counts = tf.math.bincount(
+                selected_indices,
+                minlength=self.num_classes,
+                dtype=tf.int32
+            )
+        else:
+            selected_counts = tf.zeros(self.num_classes, dtype=tf.int32)
+        
+        # Atomic updates to prevent race conditions
         self.pseudo_label_total_count.assign_add(total_counts)
         self.pseudo_label_selected_count.assign_add(selected_counts)
             
@@ -293,40 +291,58 @@ class FlexMatch:
     ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
         """
         FIXED: Calculate FlexMatch unsupervised loss with correct curriculum thresholding.
+        
+        Formula from paper: τ_c = τ * sqrt(η_c / η̄)
+        Where:
+        - τ_c is the class-specific threshold
+        - τ is the base threshold
+        - η_c is the class-specific selection rate
+        - η̄ is the average selection rate
         """
         # Generate pseudo-labels from weak augmentations
         pseudo_probs = tf.nn.softmax(logits_weak / self.T, axis=-1)
         
         # Apply distribution alignment if enabled
         if self.use_DA and tf.reduce_sum(self.p_model) > 1e-6:
+            # Ensure p_model is valid (no zeros)
             p_model_safe = tf.maximum(self.p_model, 1e-8)
+            
+            # Calculate alignment ratio: p_target / p_model
             alignment_ratio = self.p_target / p_model_safe
+            
+            # Apply alignment: p' = p * (p_target / p_model)
             pseudo_probs = pseudo_probs * alignment_ratio
+            
+            # Re-normalize to ensure valid probabilities
             pseudo_probs = pseudo_probs / (tf.reduce_sum(pseudo_probs, axis=-1, keepdims=True) + 1e-9)
         
         # Get confidence and predicted class
         max_probs = tf.reduce_max(pseudo_probs, axis=-1)
         pseudo_labels = tf.argmax(pseudo_probs, axis=-1)
         
-        # FIXED: FlexMatch curriculum thresholding (CORRECT FORMULA)
+        # FIXED: FlexMatch curriculum thresholding with correct formula
+        # Get selection rate for each sample's class
         sample_selection_rates = tf.gather(self.class_selection_rate, pseudo_labels)
+        
+        # Calculate average selection rate across all classes
         avg_selection_rate = tf.reduce_mean(self.class_selection_rate)
         
-        # Paper formula: τ_c = τ * sqrt(max(η_c, δ) / max(η̄, δ))
-        delta = 0.05  # Small constant to prevent division by zero
+        # Small constant to prevent division by zero
+        delta = 0.05
         
         # Ensure both numerator and denominator are at least delta
         safe_sample_rates = tf.maximum(sample_selection_rates, delta)
         safe_avg_rate = tf.maximum(avg_selection_rate, delta)
         
-        # Apply square root for curriculum smoothing
+        # CORRECT FORMULA: τ_c = τ * sqrt(η_c / η̄)
+        # This adjusts threshold based on relative class difficulty
         flex_thresholds = self.confidence_threshold * tf.sqrt(safe_sample_rates / safe_avg_rate)
         
-        # Clamp to reasonable bounds (more restrictive than before)
+        # Clamp thresholds to reasonable bounds
         flex_thresholds = tf.clip_by_value(
             flex_thresholds, 
-            0.5,  # Higher minimum threshold 
-            0.98  # Slightly lower maximum threshold
+            0.5,  # Lower bound prevents accepting noise
+            0.95  # Upper bound prevents rejecting everything
         )
         
         # Apply flexible thresholds for loss masking
@@ -383,9 +399,9 @@ class FlexMatch:
         }
     
     def on_epoch_end(self) -> None:
-        """Reset metrics, optimizer state, and update curriculum at the end of each epoch."""
+        """Reset metrics and update curriculum at the end of each epoch."""
         # Reset metrics
         self.reset_metrics()
-        self.update_curriculum()
         
-        logger.info(f"Updated class selection rates (η_c): {self.class_selection_rate.numpy()}")
+        # Update curriculum for next epoch
+        self.update_curriculum()
