@@ -416,7 +416,7 @@ class SemiSupervisedTrainer:
         3. Let SSL method handle ALL gradient computation (no double application)
         """
         x_labeled, y_labeled = labeled_data
-        x_unlabeled_weak, x_unlabeled_strong = unlabeled_data
+        (x_unlabeled_weak, x_unlabeled_strong), _ = unlabeled_data
 
         # Type-safe label conversion (vectorized operation)
         y_labeled = tf.cast(y_labeled, tf.int32)

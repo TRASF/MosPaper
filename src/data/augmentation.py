@@ -114,7 +114,8 @@ def _random_crop(waveform: tf.Tensor, target_len: int) -> tf.Tensor:
     length = tf.shape(waveform)[0]
     # Crop when longer than target
     def crop():
-        start = tf.random.uniform([], 0, length - target_len + 1, dtype=tf.int32)
+        max_start = tf.maximum(length - target_len, 0)
+        start = tf.random.uniform([], 0, max_start + 1, dtype=tf.int32)
         return waveform[start:start + target_len]
     # Pad with zeros when shorter
     def pad():
@@ -351,15 +352,12 @@ def _apply_cutout(waveform: tf.Tensor,
     # Calculate cutout width in samples
     max_width_ratio = aug_config.get('cutout_max_width', 0.1)  # 10% of audio
     max_width = tf.cast(tf.shape(waveform)[0] * max_width_ratio, tf.int32)
-    width = tf.random.uniform([], 1, max_width, dtype=tf.int32)
+    max_width = tf.maximum(max_width, 1)  # Ensure at least 1 sample
+    width = tf.random.uniform([], 1, max_width + 1, dtype=tf.int32)
     
-    # Random starting point
-    start = tf.random.uniform(
-        [], 
-        0, 
-        tf.shape(waveform)[0] - width, 
-        dtype=tf.int32
-    )
+    # Random starting point - ensure valid range
+    max_start = tf.maximum(tf.shape(waveform)[0] - width, 0)
+    start = tf.random.uniform([], 0, max_start + 1, dtype=tf.int32)
     
     # Create mask
     mask = tf.concat([
@@ -583,7 +581,15 @@ def augment_waveform(waveform: tf.Tensor,
     # Time shift
     sr = aug_config.get('sample_rate', 8000)
     max_shift = tf.cast(sr * aug_config.get('shift_max_sec', 0.02), tf.int32)
-    shift = tf.random.uniform([], -max_shift, max_shift, dtype=tf.int32)
+    
+    # Only apply time shift if max_shift > 0
+    def apply_time_shift():
+        return tf.random.uniform([], -max_shift, max_shift + 1, dtype=tf.int32)
+    
+    def no_time_shift():
+        return tf.constant(0, dtype=tf.int32)
+    
+    shift = tf.cond(max_shift > 0, apply_time_shift, no_time_shift)
     waveform = tf.roll(waveform, shift, axis=0)
     
     # Pitch shift
